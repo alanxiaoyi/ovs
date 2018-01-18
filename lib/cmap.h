@@ -145,6 +145,11 @@ size_t cmap_replace(struct cmap *, struct cmap_node *old_node,
 const struct cmap_node *cmap_find(const struct cmap *, uint32_t hash);
 struct cmap_node *cmap_find_protected(const struct cmap *, uint32_t hash);
 
+/* Find node by index or find index by hash */
+const struct cmap_node * cmap_find_by_index(const struct cmap *,
+                                            uint16_t index);
+uint32_t cmap_find_index(const struct cmap *, uint32_t hash);
+
 /* Looks up multiple 'hashes', when the corresponding bit in 'map' is 1,
  * and sets the corresponding pointer in 'nodes', if the hash value was
  * found from the 'cmap'.  In other cases the 'nodes' values are not changed,
