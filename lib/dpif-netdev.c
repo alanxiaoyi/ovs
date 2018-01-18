@@ -151,8 +151,10 @@ struct netdev_flow_key {
  */
 
 #define DFC_MASK_LEN 20
+#define DFC_ENTRY_PER_BUCKET 8
 #define DFC_ENTRIES (1u << DFC_MASK_LEN)
-#define DFC_MASK (DFC_ENTRIES - 1)
+#define DFC_BUCKET_CNT (DFC_ENTRIES / DFC_ENTRY_PER_BUCKET)
+#define DFC_MASK (DFC_BUCKET_CNT - 1)
 #define EMC_MASK_LEN 14
 #define EMC_ENTRIES (1u << EMC_MASK_LEN)
 #define EMC_MASK (EMC_ENTRIES - 1)
@@ -172,13 +174,14 @@ struct emc_cache {
     int sweep_idx;
 };
 
-struct dfc_entry {
-    struct dp_netdev_flow *flow;
+struct dfc_bucket {
+    uint16_t sig[DFC_ENTRY_PER_BUCKET];
+    struct dp_netdev_flow *flow[DFC_ENTRY_PER_BUCKET];
 };
 
 struct dfc_cache {
     struct emc_cache emc_cache;
-    struct dfc_entry entries[DFC_ENTRIES];
+    struct dfc_bucket buckets[DFC_BUCKET_CNT];
     int sweep_idx;
 };
 
@@ -723,9 +726,9 @@ dpif_netdev_xps_revalidate_pmd(const struct dp_netdev_pmd_thread *pmd,
 static int dpif_netdev_xps_get_tx_qid(const struct dp_netdev_pmd_thread *pmd,
                                       struct tx_port *tx);
 
-static inline bool dfc_entry_alive(struct dfc_entry *ce);
+static inline bool dfc_entry_alive(struct dp_netdev_flow *flow);
 static void emc_clear_entry(struct emc_entry *ce);
-static void dfc_clear_entry(struct dfc_entry *ce);
+static void dfc_clear_entry(struct dfc_bucket *b, int idx);
 
 static void dp_netdev_request_reconfigure(struct dp_netdev *dp);
 static inline bool
@@ -750,11 +753,13 @@ emc_cache_init(struct emc_cache *emc)
 static void
 dfc_cache_init(struct dfc_cache *flow_cache)
 {
-    int i;
+    int i, j;
 
     emc_cache_init(&flow_cache->emc_cache);
-    for (i = 0; i < ARRAY_SIZE(flow_cache->entries); i++) {
-        flow_cache->entries[i].flow = NULL;
+    for (i = 0; i < DFC_BUCKET_CNT; i++) {
+        for (j = 0; j < DFC_ENTRY_PER_BUCKET; j++) {
+            flow_cache->buckets[i].flow[j] = NULL;
+        }
     }
     flow_cache->sweep_idx = 0;
 }
@@ -772,10 +777,12 @@ emc_cache_uninit(struct emc_cache *emc)
 static void
 dfc_cache_uninit(struct dfc_cache *flow_cache)
 {
-    int i;
+    int i, j;
 
-    for (i = 0; i < ARRAY_SIZE(flow_cache->entries); i++) {
-        dfc_clear_entry(&flow_cache->entries[i]);
+    for (i = 0; i < DFC_BUCKET_CNT; i++) {
+        for (j = 0; j < DFC_ENTRY_PER_BUCKET; j++) {
+            dfc_clear_entry(&(flow_cache->buckets[i]), j);
+        }
     }
     emc_cache_uninit(&flow_cache->emc_cache);
 }
@@ -2305,39 +2312,46 @@ emc_lookup(struct emc_cache *emc, const struct netdev_flow_key *key)
     return NULL;
 }
 
-static inline struct dfc_entry *
+static inline struct dp_netdev_flow *
 dfc_entry_get(struct dfc_cache *cache, const uint32_t hash)
 {
-    return &cache->entries[hash & DFC_MASK];
+    struct dfc_bucket *bucket = &cache->buckets[hash & DFC_MASK];
+    uint16_t sig = hash >> 16;
+    for (int i = 0; i < DFC_ENTRY_PER_BUCKET; i++) {
+        if(bucket->sig[i] == sig) {
+            return bucket->flow[i];
+        }
+    }
+    return NULL;
 }
 
 static inline bool
-dfc_entry_alive(struct dfc_entry *ce)
+dfc_entry_alive(struct dp_netdev_flow *flow)
 {
-    return ce->flow && !ce->flow->dead;
+    return flow && !flow->dead;
 }
 
 static void
-dfc_clear_entry(struct dfc_entry *ce)
+dfc_clear_entry(struct dfc_bucket *b, int idx)
 {
-    if (ce->flow) {
-        dp_netdev_flow_unref(ce->flow);
-        ce->flow = NULL;
+    if (b->flow[idx]) {
+        dp_netdev_flow_unref(b->flow[idx]);
+        b->flow[idx] = NULL;
     }
 }
 
 static inline void
-dfc_change_entry(struct dfc_entry *ce, struct dp_netdev_flow *flow)
+dfc_change_entry(struct dfc_bucket *b, int idx, struct dp_netdev_flow *flow)
 {
-    if (ce->flow != flow) {
-        if (ce->flow) {
-            dp_netdev_flow_unref(ce->flow);
+    if (b->flow[idx] != flow) {
+        if (b->flow[idx]) {
+            dp_netdev_flow_unref(b->flow[idx]);
         }
 
         if (dp_netdev_flow_ref(flow)) {
-            ce->flow = flow;
+            b->flow[idx] = flow;
         } else {
-            ce->flow = NULL;
+            b->flow[idx] = NULL;
         }
     }
 }
@@ -2348,10 +2362,25 @@ dfc_insert(struct dp_netdev_pmd_thread *pmd,
            struct dp_netdev_flow *flow)
 {
     struct dfc_cache *cache = &pmd->flow_cache;
-    struct dfc_entry *current_entry;
 
-    current_entry = dfc_entry_get(cache, key->hash);
-    dfc_change_entry(current_entry, flow);
+    struct dfc_bucket *bucket = &cache->buckets[key->hash & DFC_MASK];
+    uint16_t sig = key->hash >> 16;
+    for (int i = 0; i < DFC_ENTRY_PER_BUCKET; i++) {
+        if(bucket->sig[i] == sig) {
+            dfc_change_entry(bucket, i, flow);
+            return;
+        }
+    }
+    for (int i = 0; i < DFC_ENTRY_PER_BUCKET; i++) {
+        if(bucket->flow[i] == NULL) {
+            bucket->sig[i] = sig;
+            dfc_change_entry(bucket, i, flow);
+            return;
+        }
+    }
+    int idx = random_uint32() & (DFC_ENTRY_PER_BUCKET - 1);
+    bucket->sig[idx] = sig;
+    dfc_change_entry(bucket, idx, flow);
 }
 
 static inline struct dp_netdev_flow *
@@ -2377,10 +2406,9 @@ dfc_lookup(struct dp_netdev_pmd_thread *pmd, struct netdev_flow_key *key,
     }
 
     /* EMC lookup not successful: try DFC lookup. */
-    struct dfc_entry *current_entry = dfc_entry_get(cache, key->hash);
-    flow = current_entry->flow;
+    flow = dfc_entry_get(cache, key->hash);
 
-    if (dfc_entry_alive(current_entry) &&
+    if (flow != NULL && dfc_entry_alive(flow) &&
         dpcls_rule_matches_key(&flow->cr, key)) {
 
         /* Found a match in DFC. Insert into EMC for subsequent lookups.
@@ -2414,15 +2442,20 @@ static void
 dfc_slow_sweep(struct dfc_cache *cache)
 {
     /* Sweep the EMC so that both finish in the same time. */
-    if ((cache->sweep_idx & (DFC_ENTRIES / EMC_ENTRIES - 1)) == 0) {
+    if ((cache->sweep_idx & (DFC_BUCKET_CNT / EMC_ENTRIES - 1)) == 0) {
         emc_slow_sweep(&cache->emc_cache);
     }
 
-    struct dfc_entry *entry = &cache->entries[cache->sweep_idx];
-    if (!dfc_entry_alive(entry)) {
-        dfc_clear_entry(entry);
+    if((cache->sweep_idx & (DFC_ENTRY_PER_BUCKET - 1)) == 0) {
+        uint32_t bkt = cache->sweep_idx / DFC_ENTRY_PER_BUCKET;
+        struct dfc_bucket *bucket = &cache->buckets[bkt];
+        for (int i = 0; i < DFC_ENTRY_PER_BUCKET; i++){
+            if (!dfc_entry_alive(bucket->flow[i])) {
+                dfc_clear_entry(bucket, i);
+            }
+        }
     }
-    cache->sweep_idx = (cache->sweep_idx + 1) & DFC_MASK;
+    cache->sweep_idx = (cache->sweep_idx + 1) & (DFC_ENTRIES - 1);
 }
 
 static struct dp_netdev_flow *
