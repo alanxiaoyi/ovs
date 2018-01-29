@@ -176,13 +176,12 @@ struct emc_cache {
 
 struct dfc_bucket {
     uint16_t sig[DFC_ENTRY_PER_BUCKET];
-    struct dp_netdev_flow *flow[DFC_ENTRY_PER_BUCKET];
+    uint16_t flow_idx[DFC_ENTRY_PER_BUCKET];
 };
 
 struct dfc_cache {
     struct emc_cache emc_cache;
     struct dfc_bucket buckets[DFC_BUCKET_CNT];
-    int sweep_idx;
 };
 
 
@@ -726,7 +725,6 @@ dpif_netdev_xps_revalidate_pmd(const struct dp_netdev_pmd_thread *pmd,
 static int dpif_netdev_xps_get_tx_qid(const struct dp_netdev_pmd_thread *pmd,
                                       struct tx_port *tx);
 
-static inline bool dfc_entry_alive(struct dp_netdev_flow *flow);
 static void emc_clear_entry(struct emc_entry *ce);
 static void dfc_clear_entry(struct dfc_bucket *b, int idx);
 
@@ -758,10 +756,9 @@ dfc_cache_init(struct dfc_cache *flow_cache)
     emc_cache_init(&flow_cache->emc_cache);
     for (i = 0; i < DFC_BUCKET_CNT; i++) {
         for (j = 0; j < DFC_ENTRY_PER_BUCKET; j++) {
-            flow_cache->buckets[i].flow[j] = NULL;
+            flow_cache->buckets[i].flow_idx[j] = UINT16_MAX;
         }
     }
-    flow_cache->sweep_idx = 0;
 }
 
 static void
@@ -2312,84 +2309,72 @@ emc_lookup(struct emc_cache *emc, const struct netdev_flow_key *key)
     return NULL;
 }
 
-static inline struct dp_netdev_flow *
-dfc_entry_get(struct dfc_cache *cache, const uint32_t hash)
+static inline const struct cmap_node *
+dfc_entry_get(struct dp_netdev_pmd_thread *pmd, struct dfc_cache *cache, const uint32_t hash)
 {
     struct dfc_bucket *bucket = &cache->buckets[hash & DFC_MASK];
     uint16_t sig = hash >> 16;
+    uint16_t index = UINT16_MAX;
+
     for (int i = 0; i < DFC_ENTRY_PER_BUCKET; i++) {
-        if(bucket->sig[i] == sig) {
-            return bucket->flow[i];
+        if (bucket->sig[i] == sig) {
+            index = bucket->flow_idx[i];
+            break;
         }
+    }
+    if (index != UINT16_MAX) {
+        return cmap_find_by_index(&pmd->flow_table, index);
     }
     return NULL;
 }
 
-static inline bool
-dfc_entry_alive(struct dp_netdev_flow *flow)
-{
-    return flow && !flow->dead;
-}
 
 static void
 dfc_clear_entry(struct dfc_bucket *b, int idx)
 {
-    if (b->flow[idx]) {
-        dp_netdev_flow_unref(b->flow[idx]);
-        b->flow[idx] = NULL;
-    }
-}
-
-static inline void
-dfc_change_entry(struct dfc_bucket *b, int idx, struct dp_netdev_flow *flow)
-{
-    if (b->flow[idx] != flow) {
-        if (b->flow[idx]) {
-            dp_netdev_flow_unref(b->flow[idx]);
-        }
-
-        if (dp_netdev_flow_ref(flow)) {
-            b->flow[idx] = flow;
-        } else {
-            b->flow[idx] = NULL;
-        }
-    }
+    b->flow_idx[idx] = UINT16_MAX;
 }
 
 static inline void
 dfc_insert(struct dp_netdev_pmd_thread *pmd,
            const struct netdev_flow_key *key,
-           struct dp_netdev_flow *flow)
+           uint16_t index)
 {
     struct dfc_cache *cache = &pmd->flow_cache;
-
     struct dfc_bucket *bucket = &cache->buckets[key->hash & DFC_MASK];
+
+    if (index == UINT16_MAX) {
+        return;
+    }
+
     uint16_t sig = key->hash >> 16;
     for (int i = 0; i < DFC_ENTRY_PER_BUCKET; i++) {
         if(bucket->sig[i] == sig) {
-            dfc_change_entry(bucket, i, flow);
+            bucket->flow_idx[i] = index;
             return;
         }
     }
     for (int i = 0; i < DFC_ENTRY_PER_BUCKET; i++) {
-        if(bucket->flow[i] == NULL) {
+        if(bucket->flow_idx[i] == UINT16_MAX) {
             bucket->sig[i] = sig;
-            dfc_change_entry(bucket, i, flow);
+            bucket->flow_idx[i] = index;
             return;
         }
     }
     int idx = random_uint32() & (DFC_ENTRY_PER_BUCKET - 1);
     bucket->sig[idx] = sig;
-    dfc_change_entry(bucket, idx, flow);
+    bucket->flow_idx[idx] = index;
 }
 
 static inline struct dp_netdev_flow *
-dfc_lookup(struct dp_netdev_pmd_thread *pmd, struct netdev_flow_key *key,
-           bool *exact_match)
+dfc_lookup(struct dp_netdev_pmd_thread *pmd,
+            struct netdev_flow_key *key,
+            bool *exact_match)
 {
     struct dp_netdev_flow *flow;
     uint32_t cur_min;
     struct dfc_cache *cache = &pmd->flow_cache;
+    const struct cmap_node *flow_node;
 
     /* Try an EMC lookup first. */
     atomic_read_relaxed(&pmd->dp->emc_insert_min, &cur_min);
@@ -2406,23 +2391,18 @@ dfc_lookup(struct dp_netdev_pmd_thread *pmd, struct netdev_flow_key *key,
     }
 
     /* EMC lookup not successful: try DFC lookup. */
-    flow = dfc_entry_get(cache, key->hash);
+    flow_node = dfc_entry_get(pmd, cache, key->hash);
 
-    if (flow != NULL && dfc_entry_alive(flow) &&
-        dpcls_rule_matches_key(&flow->cr, key)) {
-
-        /* Found a match in DFC. Insert into EMC for subsequent lookups.
-         * We use probabilistic insertion here so that mainly elephant
-         * flows enter EMC. */
-        key->len = netdev_flow_key_size(miniflow_n_values(&key->mf));
-        emc_probabilistic_insert(pmd, key, flow);
-        *exact_match = false;
-        return flow;
-    } else {
-
-        /* No match. Need to go to DPCLS lookup. */
-        return NULL;
+    CMAP_NODE_FOR_EACH (flow, node, flow_node) {
+        if (OVS_LIKELY(dpcls_rule_matches_key(&flow->cr, key))) {
+            key->len = netdev_flow_key_size(miniflow_n_values(&key->mf));
+            emc_probabilistic_insert(pmd, key, flow);
+            *exact_match = false;
+            return flow;
+        }
     }
+
+    return NULL;
 }
 
 /* Check and clear dead flow references slowly (one entry at each
@@ -2436,26 +2416,6 @@ emc_slow_sweep(struct emc_cache *emc)
         emc_clear_entry(entry);
     }
     emc->sweep_idx = (emc->sweep_idx + 1) & EMC_MASK;
-}
-
-static void
-dfc_slow_sweep(struct dfc_cache *cache)
-{
-    /* Sweep the EMC so that both finish in the same time. */
-    if ((cache->sweep_idx & (DFC_BUCKET_CNT / EMC_ENTRIES - 1)) == 0) {
-        emc_slow_sweep(&cache->emc_cache);
-    }
-
-    if((cache->sweep_idx & (DFC_ENTRY_PER_BUCKET - 1)) == 0) {
-        uint32_t bkt = cache->sweep_idx / DFC_ENTRY_PER_BUCKET;
-        struct dfc_bucket *bucket = &cache->buckets[bkt];
-        for (int i = 0; i < DFC_ENTRY_PER_BUCKET; i++){
-            if (!dfc_entry_alive(bucket->flow[i])) {
-                dfc_clear_entry(bucket, i);
-            }
-        }
-    }
-    cache->sweep_idx = (cache->sweep_idx + 1) & (DFC_ENTRIES - 1);
 }
 
 static struct dp_netdev_flow *
@@ -4477,8 +4437,9 @@ reload:
 
             coverage_try_clear();
             dp_netdev_pmd_try_optimize(pmd, poll_list, poll_cnt);
+
             if (!ovsrcu_try_quiesce()) {
-                dfc_slow_sweep(&pmd->flow_cache);
+                emc_slow_sweep(&((pmd->flow_cache).emc_cache));
             }
 
             atomic_read_relaxed(&pmd->reload, &reload);
@@ -5338,6 +5299,7 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
         }
         miniflow_extract(packet, &key->mf);
         key->len = 0; /* Not computed yet. */
+
         if (!md_is_valid) {
             key->hash = dpif_netdev_packet_get_rss_hash_orig_pkt(packet,
                     &key->mf);
@@ -5434,7 +5396,11 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
                                              add_actions->size);
         }
         ovs_mutex_unlock(&pmd->flow_mutex);
-        dfc_insert(pmd, key, netdev_flow);
+        uint32_t cmap_index = cmap_find_index(&pmd->flow_table,
+                                    dp_netdev_flow_hash(&netdev_flow->ufid));
+        uint16_t index = (cmap_index >= UINT16_MAX) ? UINT16_MAX :
+                                                        (uint16_t)cmap_index;
+        dfc_insert(pmd, key, index);
     }
     if (pmd_perf_metrics_enabled(pmd)) {
         /* Update upcall stats. */
@@ -5537,8 +5503,11 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
         }
 
         flow = dp_netdev_flow_cast(rules[i]);
-
-        dfc_insert(pmd, &keys[i], flow);
+        uint32_t cmap_index = cmap_find_index(&pmd->flow_table,
+                                            dp_netdev_flow_hash(&flow->ufid));
+        uint16_t index = (cmap_index >= UINT16_MAX) ? UINT16_MAX :
+                                                        (uint16_t)cmap_index;
+        dfc_insert(pmd, &keys[i], index);
         dp_netdev_queue_batches(packet, flow, &keys[i].mf, batches, n_batches);
     }
 
