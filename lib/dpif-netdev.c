@@ -128,19 +128,19 @@ struct netdev_flow_key {
     uint64_t buf[FLOW_MAX_PACKET_U64S];
 };
 
-/* Exact match cache for frequently used flows
+/* Datapath flow cache (DFC) for frequently used flows
  *
- * The cache uses a 32-bit hash of the packet (which can be the RSS hash) to
- * search its entries for a miniflow that matches exactly the miniflow of the
- * packet. It stores the 'dpcls_rule' (rule) that matches the miniflow.
+ * The cache uses the 32-bit hash of the packet (which can be the RSS hash) to
+ * directly look up a pointer to the matching megaflow. To check for a match
+ * the packet's flow key is compared against the key and mask of the megaflow.
  *
- * A cache entry holds a reference to its 'dp_netdev_flow'.
+ * For even faster lookup, the most frequently used packet flows are also
+ * inserted into a small exact match cache (EMC). The EMC uses a part of the
+ * packet hash to look up a miniflow that matches exactly the miniflow of the
+ * packet. The matching EMC also returns a reference to the megaflow.
  *
- * A miniflow with a given hash can be in one of EM_FLOW_HASH_SEGS different
- * entries. The 32-bit hash is split into EM_FLOW_HASH_SEGS values (each of
- * them is EM_FLOW_HASH_SHIFT bits wide and the remainder is thrown away). Each
- * value is the index of a cache entry where the miniflow could be.
- *
+ * Flows are promoted from the DFC to the EMC through probabilistic insertion
+ * after successful DFC lookup with minor probability to favor elephant flows.
  *
  * Thread-safety
  * =============
@@ -149,33 +149,38 @@ struct netdev_flow_key {
  * If dp_netdev_input is not called from a pmd thread, a mutex is used.
  */
 
-#define EM_FLOW_HASH_SHIFT 13
-#define EM_FLOW_HASH_ENTRIES (1u << EM_FLOW_HASH_SHIFT)
-#define EM_FLOW_HASH_MASK (EM_FLOW_HASH_ENTRIES - 1)
-#define EM_FLOW_HASH_SEGS 2
+#define DFC_MASK_LEN 20
+#define DFC_ENTRIES (1u << DFC_MASK_LEN)
+#define DFC_MASK (DFC_ENTRIES - 1)
+#define EMC_MASK_LEN 14
+#define EMC_ENTRIES (1u << EMC_MASK_LEN)
+#define EMC_MASK (EMC_ENTRIES - 1)
 
 /* Default EMC insert probability is 1 / DEFAULT_EM_FLOW_INSERT_INV_PROB */
-#define DEFAULT_EM_FLOW_INSERT_INV_PROB 100
+#define DEFAULT_EM_FLOW_INSERT_INV_PROB 1000
 #define DEFAULT_EM_FLOW_INSERT_MIN (UINT32_MAX /                     \
                                     DEFAULT_EM_FLOW_INSERT_INV_PROB)
 
 struct emc_entry {
     struct dp_netdev_flow *flow;
-    struct netdev_flow_key key;   /* key.hash used for emc hash value. */
+    char key[248];   /* Holds struct netdev_flow_key of limited size. */
 };
 
 struct emc_cache {
-    struct emc_entry entries[EM_FLOW_HASH_ENTRIES];
-    int sweep_idx;                /* For emc_cache_slow_sweep(). */
+    struct emc_entry entries[EMC_ENTRIES];
+    int sweep_idx;
 };
 
-/* Iterate in the exact match cache through every entry that might contain a
- * miniflow with hash 'HASH'. */
-#define EMC_FOR_EACH_POS_WITH_HASH(EMC, CURRENT_ENTRY, HASH)                 \
-    for (uint32_t i__ = 0, srch_hash__ = (HASH);                             \
-         (CURRENT_ENTRY) = &(EMC)->entries[srch_hash__ & EM_FLOW_HASH_MASK], \
-         i__ < EM_FLOW_HASH_SEGS;                                            \
-         i__++, srch_hash__ >>= EM_FLOW_HASH_SHIFT)
+struct dfc_entry {
+    struct dp_netdev_flow *flow;
+};
+
+struct dfc_cache {
+    struct emc_cache emc_cache;
+    struct dfc_entry entries[DFC_ENTRIES];
+    int sweep_idx;
+};
+
 
 /* Simple non-wildcarding single-priority classifier. */
 
@@ -216,7 +221,8 @@ static bool dpcls_lookup(struct dpcls *cls,
                          const struct netdev_flow_key keys[],
                          struct dpcls_rule **rules, size_t cnt,
                          int *num_lookups_p);
-
+static bool dpcls_rule_matches_key(const struct dpcls_rule *rule,
+                            const struct netdev_flow_key *target);
 /* Set of supported meter flags */
 #define DP_SUPPORTED_METER_FLAGS_MASK \
     (OFPMF13_STATS | OFPMF13_PKTPS | OFPMF13_KBPS | OFPMF13_BURST)
@@ -548,7 +554,7 @@ struct dp_netdev_pmd_thread {
      * NON_PMD_CORE_ID can be accessed by multiple threads, and thusly
      * need to be protected by 'non_pmd_mutex'.  Every other instance
      * will only be accessed by its own pmd thread. */
-    struct emc_cache flow_cache;
+    OVS_ALIGNED_VAR(CACHE_LINE_SIZE) struct dfc_cache flow_cache;
 
     /* Flow-Table and classifiers
      *
@@ -713,46 +719,59 @@ dpif_netdev_xps_revalidate_pmd(const struct dp_netdev_pmd_thread *pmd,
 static int dpif_netdev_xps_get_tx_qid(const struct dp_netdev_pmd_thread *pmd,
                                       struct tx_port *tx);
 
-static inline bool emc_entry_alive(struct emc_entry *ce);
+static inline bool dfc_entry_alive(struct dfc_entry *ce);
 static void emc_clear_entry(struct emc_entry *ce);
+static void dfc_clear_entry(struct dfc_entry *ce);
 
 static void dp_netdev_request_reconfigure(struct dp_netdev *dp);
 
 static void
-emc_cache_init(struct emc_cache *flow_cache)
+emc_cache_init(struct emc_cache *emc)
 {
     int i;
 
-    flow_cache->sweep_idx = 0;
+    for (i = 0; i < ARRAY_SIZE(emc->entries); i++) {
+        emc->entries[i].flow = NULL;
+        struct netdev_flow_key *key =
+                (struct netdev_flow_key *) emc->entries[i].key;
+        key->hash = 0;
+        key->len = sizeof(struct miniflow);
+        flowmap_init(&key->mf.map);
+    }
+    emc->sweep_idx = 0;
+}
+
+static void
+dfc_cache_init(struct dfc_cache *flow_cache)
+{
+    int i;
+
+    emc_cache_init(&flow_cache->emc_cache);
     for (i = 0; i < ARRAY_SIZE(flow_cache->entries); i++) {
         flow_cache->entries[i].flow = NULL;
-        flow_cache->entries[i].key.hash = 0;
-        flow_cache->entries[i].key.len = sizeof(struct miniflow);
-        flowmap_init(&flow_cache->entries[i].key.mf.map);
+    }
+    flow_cache->sweep_idx = 0;
+}
+
+static void
+emc_cache_uninit(struct emc_cache *emc)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(emc->entries); i++) {
+        emc_clear_entry(&emc->entries[i]);
     }
 }
 
 static void
-emc_cache_uninit(struct emc_cache *flow_cache)
+dfc_cache_uninit(struct dfc_cache *flow_cache)
 {
     int i;
 
     for (i = 0; i < ARRAY_SIZE(flow_cache->entries); i++) {
-        emc_clear_entry(&flow_cache->entries[i]);
+        dfc_clear_entry(&flow_cache->entries[i]);
     }
-}
-
-/* Check and clear dead flow references slowly (one entry at each
- * invocation).  */
-static void
-emc_cache_slow_sweep(struct emc_cache *flow_cache)
-{
-    struct emc_entry *entry = &flow_cache->entries[flow_cache->sweep_idx];
-
-    if (!emc_entry_alive(entry)) {
-        emc_clear_entry(entry);
-    }
-    flow_cache->sweep_idx = (flow_cache->sweep_idx + 1) & EM_FLOW_HASH_MASK;
+    emc_cache_uninit(&flow_cache->emc_cache);
 }
 
 /* Updates the time in PMD threads context and should be called in three cases:
@@ -852,6 +871,7 @@ pmd_info_show_stats(struct ds *reply,
                   "\tpacket recirculations: %"PRIu64"\n"
                   "\tavg. datapath passes per packet: %.02f\n"
                   "\temc hits: %"PRIu64"\n"
+                  "\tdfc hits: %"PRIu64"\n"
                   "\tmegaflow hits: %"PRIu64"\n"
                   "\tavg. subtable lookups per megaflow hit: %.02f\n"
                   "\tmiss with success upcall: %"PRIu64"\n"
@@ -859,6 +879,7 @@ pmd_info_show_stats(struct ds *reply,
                   "\tavg. packets per output batch: %.02f\n",
                   total_packets, stats[PMD_STAT_RECIRC],
                   passes_per_pkt, stats[PMD_STAT_EXACT_HIT],
+                  stats[PMD_STAT_DFC_HIT],
                   stats[PMD_STAT_MASKED_HIT], lookups_per_hit,
                   stats[PMD_STAT_MISS], stats[PMD_STAT_LOST],
                   packets_per_batch);
@@ -1476,6 +1497,7 @@ dpif_netdev_get_stats(const struct dpif *dpif, struct dpif_dp_stats *stats)
         stats->n_flows += cmap_count(&pmd->flow_table);
         pmd_perf_read_counters(&pmd->perf_stats, pmd_stats);
         stats->n_hit += pmd_stats[PMD_STAT_EXACT_HIT];
+        stats->n_hit += pmd_stats[PMD_STAT_DFC_HIT];
         stats->n_hit += pmd_stats[PMD_STAT_MASKED_HIT];
         stats->n_missed += pmd_stats[PMD_STAT_MISS];
         stats->n_lost += pmd_stats[PMD_STAT_LOST];
@@ -2094,6 +2116,16 @@ netdev_flow_key_hash_in_mask(const struct netdev_flow_key *key,
     return hash_finish(hash, (p - miniflow_get_values(&mask->mf)) * 8);
 }
 
+/*
+ * Datapath Flow Cache and EMC implementation
+ */
+
+static inline struct emc_entry *
+emc_entry_get(struct emc_cache *emc, const uint32_t hash)
+{
+    return &emc->entries[hash & EMC_MASK];
+}
+
 static inline bool
 emc_entry_alive(struct emc_entry *ce)
 {
@@ -2110,9 +2142,15 @@ emc_clear_entry(struct emc_entry *ce)
 }
 
 static inline void
-emc_change_entry(struct emc_entry *ce, struct dp_netdev_flow *flow,
-                 const struct netdev_flow_key *key)
+emc_change_entry(struct emc_entry *ce, const struct netdev_flow_key *key,
+                 struct dp_netdev_flow *flow)
 {
+    /* We only store small enough flows in the EMC. */
+    size_t key_size = offsetof(struct netdev_flow_key, mf) + key->len;
+    if (key_size > sizeof(ce->key)) {
+        return;
+    }
+
     if (ce->flow != flow) {
         if (ce->flow) {
             dp_netdev_flow_unref(ce->flow);
@@ -2124,38 +2162,7 @@ emc_change_entry(struct emc_entry *ce, struct dp_netdev_flow *flow,
             ce->flow = NULL;
         }
     }
-    if (key) {
-        netdev_flow_key_clone(&ce->key, key);
-    }
-}
-
-static inline void
-emc_insert(struct emc_cache *cache, const struct netdev_flow_key *key,
-           struct dp_netdev_flow *flow)
-{
-    struct emc_entry *to_be_replaced = NULL;
-    struct emc_entry *current_entry;
-
-    EMC_FOR_EACH_POS_WITH_HASH(cache, current_entry, key->hash) {
-        if (netdev_flow_key_equal(&current_entry->key, key)) {
-            /* We found the entry with the 'mf' miniflow */
-            emc_change_entry(current_entry, flow, NULL);
-            return;
-        }
-
-        /* Replacement policy: put the flow in an empty (not alive) entry, or
-         * in the first entry where it can be */
-        if (!to_be_replaced
-            || (emc_entry_alive(to_be_replaced)
-                && !emc_entry_alive(current_entry))
-            || current_entry->key.hash < to_be_replaced->key.hash) {
-            to_be_replaced = current_entry;
-        }
-    }
-    /* We didn't find the miniflow in the cache.
-     * The 'to_be_replaced' entry is where the new flow will be stored */
-
-    emc_change_entry(to_be_replaced, flow, key);
+    netdev_flow_key_clone((struct netdev_flow_key *) ce->key, key);
 }
 
 static inline void
@@ -2168,29 +2175,151 @@ emc_probabilistic_insert(struct dp_netdev_pmd_thread *pmd,
      * probability of 1/100 ie. 1% */
 
     uint32_t min;
+    struct emc_cache *emc = &(pmd->flow_cache).emc_cache;
+
     atomic_read_relaxed(&pmd->dp->emc_insert_min, &min);
 
     if (min && random_uint32() <= min) {
-        emc_insert(&pmd->flow_cache, key, flow);
+        struct emc_entry *current_entry = emc_entry_get(emc, key->hash);
+        emc_change_entry(current_entry, key, flow);
     }
 }
 
 static inline struct dp_netdev_flow *
-emc_lookup(struct emc_cache *cache, const struct netdev_flow_key *key)
+emc_lookup(struct emc_cache *emc, const struct netdev_flow_key *key)
 {
-    struct emc_entry *current_entry;
+    struct emc_entry *current_entry = emc_entry_get(emc, key->hash);
+    struct netdev_flow_key *current_key =
+            (struct netdev_flow_key *) current_entry->key;
 
-    EMC_FOR_EACH_POS_WITH_HASH(cache, current_entry, key->hash) {
-        if (current_entry->key.hash == key->hash
-            && emc_entry_alive(current_entry)
-            && netdev_flow_key_equal_mf(&current_entry->key, &key->mf)) {
+    if (current_key->hash == key->hash
+        && emc_entry_alive(current_entry)
+        && netdev_flow_key_equal_mf(current_key, &key->mf)) {
 
-            /* We found the entry with the 'key->mf' miniflow */
-            return current_entry->flow;
+        /* We found the entry with the 'key->mf' miniflow */
+        return current_entry->flow;
+    }
+    return NULL;
+}
+
+static inline struct dfc_entry *
+dfc_entry_get(struct dfc_cache *cache, const uint32_t hash)
+{
+    return &cache->entries[hash & DFC_MASK];
+}
+
+static inline bool
+dfc_entry_alive(struct dfc_entry *ce)
+{
+    return ce->flow && !ce->flow->dead;
+}
+
+static void
+dfc_clear_entry(struct dfc_entry *ce)
+{
+    if (ce->flow) {
+        dp_netdev_flow_unref(ce->flow);
+        ce->flow = NULL;
+    }
+}
+
+static inline void
+dfc_change_entry(struct dfc_entry *ce, struct dp_netdev_flow *flow)
+{
+    if (ce->flow != flow) {
+        if (ce->flow) {
+            dp_netdev_flow_unref(ce->flow);
+        }
+
+        if (dp_netdev_flow_ref(flow)) {
+            ce->flow = flow;
+        } else {
+            ce->flow = NULL;
         }
     }
+}
 
-    return NULL;
+static inline void
+dfc_insert(struct dp_netdev_pmd_thread *pmd,
+           const struct netdev_flow_key *key,
+           struct dp_netdev_flow *flow)
+{
+    struct dfc_cache *cache = &pmd->flow_cache;
+    struct dfc_entry *current_entry;
+
+    current_entry = dfc_entry_get(cache, key->hash);
+    dfc_change_entry(current_entry, flow);
+}
+
+static inline struct dp_netdev_flow *
+dfc_lookup(struct dp_netdev_pmd_thread *pmd, struct netdev_flow_key *key,
+           bool *exact_match)
+{
+    struct dp_netdev_flow *flow;
+    uint32_t cur_min;
+    struct dfc_cache *cache = &pmd->flow_cache;
+
+    /* Try an EMC lookup first. */
+    atomic_read_relaxed(&pmd->dp->emc_insert_min, &cur_min);
+
+    if(cur_min) {
+        flow = emc_lookup(&cache->emc_cache, key);
+    }
+    else {
+        flow = NULL;
+    }
+    if (flow) {
+        *exact_match = true;
+        return flow;
+    }
+
+    /* EMC lookup not successful: try DFC lookup. */
+    struct dfc_entry *current_entry = dfc_entry_get(cache, key->hash);
+    flow = current_entry->flow;
+
+    if (dfc_entry_alive(current_entry) &&
+        dpcls_rule_matches_key(&flow->cr, key)) {
+
+        /* Found a match in DFC. Insert into EMC for subsequent lookups.
+         * We use probabilistic insertion here so that mainly elephant
+         * flows enter EMC. */
+        key->len = netdev_flow_key_size(miniflow_n_values(&key->mf));
+        emc_probabilistic_insert(pmd, key, flow);
+        *exact_match = false;
+        return flow;
+    } else {
+
+        /* No match. Need to go to DPCLS lookup. */
+        return NULL;
+    }
+}
+
+/* Check and clear dead flow references slowly (one entry at each
+ * invocation).  */
+static void
+emc_slow_sweep(struct emc_cache *emc)
+{
+    struct emc_entry *entry = &emc->entries[emc->sweep_idx];
+
+    if (!emc_entry_alive(entry)) {
+        emc_clear_entry(entry);
+    }
+    emc->sweep_idx = (emc->sweep_idx + 1) & EMC_MASK;
+}
+
+static void
+dfc_slow_sweep(struct dfc_cache *cache)
+{
+    /* Sweep the EMC so that both finish in the same time. */
+    if ((cache->sweep_idx & (DFC_ENTRIES / EMC_ENTRIES - 1)) == 0) {
+        emc_slow_sweep(&cache->emc_cache);
+    }
+
+    struct dfc_entry *entry = &cache->entries[cache->sweep_idx];
+    if (!dfc_entry_alive(entry)) {
+        dfc_clear_entry(entry);
+    }
+    cache->sweep_idx = (cache->sweep_idx + 1) & DFC_MASK;
 }
 
 static struct dp_netdev_flow *
@@ -2444,17 +2573,11 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
     ovs_assert(match->wc.masks.in_port.odp_port == ODPP_NONE);
     odp_port_t in_port = match->flow.in_port.odp_port;
 
-    /* As we select the dpcls based on the port number, each netdev flow
-     * belonging to the same dpcls will have the same odp_port value.
-     * For performance reasons we wildcard odp_port here in the mask.  In the
-     * typical case dp_hash is also wildcarded, and the resulting 8-byte
-     * chunk {dp_hash, in_port} will be ignored by netdev_flow_mask_init() and
-     * will not be part of the subtable mask.
-     * This will speed up the hash computation during dpcls_lookup() because
-     * there is one less call to hash_add64() in this case. */
-    match->wc.masks.in_port.odp_port = 0;
+    /* Since we added DFC cache per PMD, the input port is needed to match
+     * the key in DFC. DFC is not per port. Otherwise in_port could be
+     * excluded from mask */
+
     netdev_flow_mask_init(&mask, match);
-    match->wc.masks.in_port.odp_port = ODPP_NONE;
 
     /* Make sure wc does not have metadata. */
     ovs_assert(!FLOWMAP_HAS_FIELD(&mask.mf.map, metadata)
@@ -4114,7 +4237,7 @@ pmd_thread_main(void *f_)
     ovs_numa_thread_setaffinity_core(pmd->core_id);
     dpdk_set_lcore_id(pmd->core_id);
     poll_cnt = pmd_load_queues_and_ports(pmd, &poll_list);
-    emc_cache_init(&pmd->flow_cache);
+    dfc_cache_init(&pmd->flow_cache);
 reload:
     pmd_alloc_static_tx_qid(pmd);
 
@@ -4165,7 +4288,7 @@ reload:
             coverage_try_clear();
             dp_netdev_pmd_try_optimize(pmd, poll_list, poll_cnt);
             if (!ovsrcu_try_quiesce()) {
-                emc_cache_slow_sweep(&pmd->flow_cache);
+                dfc_slow_sweep(&pmd->flow_cache);
             }
 
             atomic_read_relaxed(&pmd->reload, &reload);
@@ -4188,7 +4311,7 @@ reload:
         goto reload;
     }
 
-    emc_cache_uninit(&pmd->flow_cache);
+    dfc_cache_uninit(&pmd->flow_cache);
     free(poll_list);
     pmd_free_cached_ports(pmd);
     return NULL;
@@ -4624,7 +4747,7 @@ dp_netdev_configure_pmd(struct dp_netdev_pmd_thread *pmd, struct dp_netdev *dp,
     /* init the 'flow_cache' since there is no
      * actual thread created for NON_PMD_CORE_ID. */
     if (core_id == NON_PMD_CORE_ID) {
-        emc_cache_init(&pmd->flow_cache);
+        dfc_cache_init(&pmd->flow_cache);
         pmd_alloc_static_tx_qid(pmd);
     }
     pmd_perf_stats_init(&pmd->perf_stats);
@@ -4667,7 +4790,7 @@ dp_netdev_del_pmd(struct dp_netdev *dp, struct dp_netdev_pmd_thread *pmd)
      * but extra cleanup is necessary */
     if (pmd->core_id == NON_PMD_CORE_ID) {
         ovs_mutex_lock(&dp->non_pmd_mutex);
-        emc_cache_uninit(&pmd->flow_cache);
+        dfc_cache_uninit(&pmd->flow_cache);
         pmd_free_cached_ports(pmd);
         pmd_free_static_tx_qid(pmd);
         ovs_mutex_unlock(&dp->non_pmd_mutex);
@@ -4971,7 +5094,7 @@ dp_netdev_queue_batches(struct dp_packet *pkt,
     packet_batch_per_flow_update(batch, pkt, mf);
 }
 
-/* Try to process all ('cnt') the 'packets' using only the exact match cache
+/* Try to process all ('cnt') the 'packets' using only the PMD flow cache
  * 'pmd->flow_cache'. If a flow is not found for a packet 'packets[i]', the
  * miniflow is copied into 'keys' and the packet pointer is moved at the
  * beginning of the 'packets' array.
@@ -4986,21 +5109,19 @@ dp_netdev_queue_batches(struct dp_packet *pkt,
  * will be ignored.
  */
 static inline size_t
-emc_processing(struct dp_netdev_pmd_thread *pmd,
+dfc_processing(struct dp_netdev_pmd_thread *pmd,
                struct dp_packet_batch *packets_,
                struct netdev_flow_key *keys,
                struct packet_batch_per_flow batches[], size_t *n_batches,
                bool md_is_valid, odp_port_t port_no)
 {
-    struct emc_cache *flow_cache = &pmd->flow_cache;
     struct netdev_flow_key *key = &keys[0];
-    size_t n_missed = 0, n_dropped = 0;
+    size_t n_missed = 0, n_dfc_hit = 0, n_emc_hit = 0;
     struct dp_packet *packet;
     const size_t cnt = dp_packet_batch_size(packets_);
-    uint32_t cur_min;
     int i;
+    bool exact_match;
 
-    atomic_read_relaxed(&pmd->dp->emc_insert_min, &cur_min);
     pmd_perf_update_counter(&pmd->perf_stats,
                             md_is_valid ? PMD_STAT_RECIRC : PMD_STAT_RECV,
                             cnt);
@@ -5010,7 +5131,6 @@ emc_processing(struct dp_netdev_pmd_thread *pmd,
 
         if (OVS_UNLIKELY(dp_packet_size(packet) < ETH_HEADER_LEN)) {
             dp_packet_delete(packet);
-            n_dropped++;
             continue;
         }
 
@@ -5026,19 +5146,20 @@ emc_processing(struct dp_netdev_pmd_thread *pmd,
         }
         miniflow_extract(packet, &key->mf);
         key->len = 0; /* Not computed yet. */
-        /* If EMC is disabled skip hash computation and emc_lookup */
-        if (cur_min) {
-            if (!md_is_valid) {
-                key->hash = dpif_netdev_packet_get_rss_hash_orig_pkt(packet,
-                        &key->mf);
-            } else {
-                key->hash = dpif_netdev_packet_get_rss_hash(packet, &key->mf);
-            }
-            flow = emc_lookup(flow_cache, key);
+        if (!md_is_valid) {
+            key->hash = dpif_netdev_packet_get_rss_hash_orig_pkt(packet,
+                    &key->mf);
         } else {
-            flow = NULL;
+            key->hash = dpif_netdev_packet_get_rss_hash(packet, &key->mf);
         }
+        flow = dfc_lookup(pmd, key, &exact_match);
+
         if (OVS_LIKELY(flow)) {
+            if (exact_match) {
+                n_emc_hit++;
+            } else {
+                n_dfc_hit++;
+            }
             dp_netdev_queue_batches(packet, flow, &key->mf, batches,
                                     n_batches);
         } else {
@@ -5052,8 +5173,8 @@ emc_processing(struct dp_netdev_pmd_thread *pmd,
         }
     }
 
-    pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_EXACT_HIT,
-                            cnt - n_dropped - n_missed);
+    pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_EXACT_HIT, n_emc_hit);
+    pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_DFC_HIT, n_dfc_hit);
 
     return dp_packet_batch_size(packets_);
 }
@@ -5120,7 +5241,7 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
                                              add_actions->size);
         }
         ovs_mutex_unlock(&pmd->flow_mutex);
-        emc_probabilistic_insert(pmd, key, netdev_flow);
+        dfc_insert(pmd, key, netdev_flow);
     }
     return error;
 }
@@ -5216,7 +5337,7 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
 
         flow = dp_netdev_flow_cast(rules[i]);
 
-        emc_probabilistic_insert(pmd, &keys[i], flow);
+        dfc_insert(pmd, &keys[i], flow);
         dp_netdev_queue_batches(packet, flow, &keys[i].mf, batches, n_batches);
     }
 
@@ -5252,7 +5373,7 @@ dp_netdev_input__(struct dp_netdev_pmd_thread *pmd,
     odp_port_t in_port;
 
     n_batches = 0;
-    emc_processing(pmd, packets, keys, batches, &n_batches,
+    dfc_processing(pmd, packets, keys, batches, &n_batches,
                             md_is_valid, port_no);
     if (!dp_packet_batch_is_empty(packets)) {
         /* Get ingress port from first packet's metadata. */
@@ -6203,7 +6324,7 @@ dpcls_remove(struct dpcls *cls, struct dpcls_rule *rule)
 
 /* Returns true if 'target' satisfies 'key' in 'mask', that is, if each 1-bit
  * in 'mask' the values in 'key' and 'target' are the same. */
-static inline bool
+static bool
 dpcls_rule_matches_key(const struct dpcls_rule *rule,
                        const struct netdev_flow_key *target)
 {
