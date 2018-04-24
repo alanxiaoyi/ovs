@@ -155,6 +155,8 @@ struct netdev_flow_key {
 #define SMC_ENTRIES (1u << 20)
 #define SMC_BUCKET_CNT (SMC_ENTRIES / SMC_ENTRY_PER_BUCKET)
 #define SMC_MASK (SMC_BUCKET_CNT - 1)
+#define SMC_OFF_CNT (1u << 15)
+#define SMC_ON_CNT (1u << 14)
 
 #define EMC_MASK_LEN 14
 #define EMC_ENTRIES (1u << EMC_MASK_LEN)
@@ -183,6 +185,7 @@ struct smc_bucket {
 /* Signature match cache, differentiate from EMC cache */
 struct smc_cache {
     struct smc_bucket buckets[SMC_BUCKET_CNT];
+    uint8_t enable;   /* disable SMC when there are too many megaflows */
 };
 
 struct dfc_cache {
@@ -763,6 +766,7 @@ smc_cache_init(struct smc_cache *smc_cache)
             smc_cache->buckets[i].flow_idx[j] = UINT16_MAX;
         }
     }
+    smc_cache->enable = 1;
 }
 
 static void
@@ -2361,9 +2365,16 @@ smc_insert(struct dp_netdev_pmd_thread *pmd,
     struct smc_cache *smc_cache = &pmd->flow_cache.smc_cache;
     struct smc_bucket *bucket = &smc_cache->buckets[key->hash & SMC_MASK];
     uint16_t index;
-    uint32_t cmap_index = cmap_find_index(&pmd->flow_table, hash);
+    uint32_t cmap_index;
+
+    if (!smc_cache->enable) {
+        return 0;
+    }
+
+    cmap_index = cmap_find_index(&pmd->flow_table, hash);
     index = (cmap_index >= UINT16_MAX) ? UINT16_MAX : (uint16_t)cmap_index;
 
+    /* If the index is larger than SMC can handel */
     if (index == UINT16_MAX) {
         return 0;
     }
@@ -5360,6 +5371,7 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
             /* 'key[n_missed]' contains the key of the current packet and it
              * must be returned to the caller. The next key should be extracted
              * to 'keys[n_missed + 1]'. */
+            missed_keys[n_missed] = key;
             key = &keys[++n_missed];
         }
     }
@@ -5367,7 +5379,7 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
     pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_EXACT_HIT, n_emc_hit);
 
     /* Packets miss EMC will do a batch lookup in SMC */
-    if (n_missed != 0) {
+    if (n_missed != 0 && (pmd->flow_cache).smc_cache.enable) {
         smc_lookup_batch(pmd, keys, missed_keys, packets_, batches,
                             n_batches, n_missed);
     }
@@ -6469,6 +6481,7 @@ dp_netdev_pmd_try_optimize(struct dp_netdev_pmd_thread *pmd,
                            struct polled_queue *poll_list, int poll_cnt)
 {
     struct dpcls *cls;
+    struct smc_cache *smc = &(pmd->flow_cache).smc_cache;
 
     if (pmd->ctx.now > pmd->rxq_next_cycle_store) {
         uint64_t curr_tsc;
@@ -6503,6 +6516,14 @@ dp_netdev_pmd_try_optimize(struct dp_netdev_pmd_thread *pmd,
             /* Start new measuring interval */
             pmd->next_optimization = pmd->ctx.now
                                      + DPCLS_OPTIMIZATION_INTERVAL;
+        }
+
+        uint32_t cnt = cmap_count(&pmd->flow_table);
+        if (smc->enable && cnt >= SMC_OFF_CNT) {
+            smc->enable = 0;
+        }
+        else if (!smc->enable && cnt < SMC_ON_CNT) {
+            smc->enable = 1;
         }
     }
 }
